@@ -1,0 +1,110 @@
+---
+title: "Using the Pelechano et al TIF-seq dataset to find the 3'UTR and 5'UTR isoforms for all genes in the yeast genome"
+output: html_notebook
+---
+
+
+Pelechano et al has the different isoforms in genomic coordinates and this code converts the genomic coordinates to actual sequences.
+```{r import}
+library(tidyverse)
+library(stringi)
+
+# Data is poorly formated (spaces between columns and inside columns...) so have to crudely import it then separate
+fullTifSeqDataset <- read_csv("../data/pelechano_TIFseq.txt",skip = 1,col_names = FALSE) %>% 
+  separate(X1,into = c("chr","type"), sep = " (?=[-+])") %>% 
+  separate(type,into = c("strand","type"), sep = "(?<=[-+]) ") %>%
+  separate(type,into = c("t5","type"), sep = " (?=[0-9]+ [0-9]+ [0-9]+)") %>%
+  separate(type,into = c("t3","type"), sep = " (?=[0-9]+ [0-9]+)") %>%
+  separate(type,into = c("ypd","type"), sep = "(?<=^[0-9]{1,6}) ") %>%
+  separate(type,into = c("gal","type"), sep = "(?<=^[0-9]{1,6}) ") %>%
+  separate(type,into = c("type","gene"), sep = " (?=[0-9A-Z-_]+$)") %>% 
+  mutate(t5=as.integer(t5),t3=as.integer(t3),ypd=as.integer(ypd),gal=as.integer(gal))
+
+# import dataset of all known yeast gene orf names
+library(Biostrings)
+ScerORF <- readDNAStringSet("https://downloads.yeastgenome.org/sequence/S288C_reference/orf_dna/orf_coding_all.fasta.gz")
+
+# Separate gene name from fasta file comment section
+ScerORFName <- as_tibble(names(ScerORF)) %>%
+  separate(value,c("transcriptName",NA),extra="drop",sep=" ")
+
+# Separate gene position in genomic coordinates from fasta file comment section
+ScerORFData <- tibble(gene = ScerORFName$transcriptName,startSite = as.integer(str_extract(names(ScerORF),"(?<=Chr [IVX]{1,5} from )[0-9]+")),endSite = as.integer(str_extract(names(ScerORF),"(?<=Chr [IVX]{1,5} from [0-9]{1,10}-)[0-9]+")))
+
+# filter Tif-seq data to only known ORFs
+ORFTifSeqDataset <- fullTifSeqDataset %>%
+  filter(fullTifSeqDataset$gene%in%ScerORFName$transcriptName)
+
+# filter again so that only pairs fully covering an ORF are accepted
+intactORFTifSeqDataset <- ORFTifSeqDataset %>%
+  filter(type == "Covering one intact ORF") %>%
+  select(-type)
+
+# create new dataframe with 3' end, 5' end and orf positions, then add chromosome sequences
+completemTIFIsoformDataset <- intactORFTifSeqDataset %>%
+  inner_join(ScerORFData,by = "gene") %>%
+  group_by(chr) %>%
+  nest() 
+
+# Access the full yeast genome to convert genomic coordinates to sequences
+# BiocManager::install("BSgenome.Scerevisiae.UCSC.sacCer3")
+fullYeastGenome <- BSgenome::getBSgenome("BSgenome.Scerevisiae.UCSC.sacCer3")
+seqnames(fullYeastGenome) <-as.character(c(1:17))
+
+# Create a tibble of the main and the complement of the yeast genome (for genes on the negative strand)
+mainAndRevCompfullYeastGenome <- tibble(chr = vector(mode = "character"), mainChrom = vector(mode = "character"), compChrom = vector(mode = "character"))
+for(i in 1:17){
+  mainAndRevCompfullYeastGenome <- mainAndRevCompfullYeastGenome %>%
+    bind_rows(tibble(chr = as.character(i), mainChrom = toString(fullYeastGenome[[i]]), compChrom = toString(complement(fullYeastGenome[[i]]))))
+}
+
+# add chromsome data to TIFseq dataset
+chromosomeAndmTIFIsoformDataset <- completemTIFIsoformDataset %>%
+  inner_join(mainAndRevCompfullYeastGenome)
+
+# function to convert positions to sequences
+positionToSequence <- function(startPos,endPos,chromosomeSeq){
+   str_sub(chromosomeSeq,startPos,endPos)
+}
+
+# function to convert 3'UTR and 5'UTR positions to actual sequences
+UTRSequencesConversion <- function(TIFseqData,mainChromosomeSeq,complementChromosomeSeq){
+  negativeStrand <- TIFseqData %>% 
+    filter(strand == "-")
+  
+  positiveStrand <- TIFseqData %>% 
+    filter(strand == "+")
+  
+  # add 3'UTR and 5'UTR sequences to strand (reverse sequence so that start/stop codons are in the same orientation as main strand)
+  negativeStrand <- negativeStrand %>%
+    group_by(t5, t3,startSite,endSite) %>%
+    mutate(fivePrimeUTR = stri_reverse(map_chr(startSite + 1,positionToSequence,t5,complementChromosomeSeq))) %>%
+    mutate(threePrimeUTR = stri_reverse(map_chr(t3,positionToSequence,endSite - 1,complementChromosomeSeq)))
+  
+  positiveStrand <- positiveStrand %>%
+    group_by(t5, t3,startSite,endSite) %>%
+    mutate(fivePrimeUTR = map_chr(t5,positionToSequence,startSite - 1,mainChromosomeSeq)) %>%
+    mutate(threePrimeUTR = map_chr(endSite + 1,positionToSequence,t3,mainChromosomeSeq))
+    
+    bind_rows(negativeStrand,positiveStrand)
+}
+
+# get sequences for all isoforms 
+allMajor3UTR5UTRIsoformSequences <- chromosomeAndmTIFIsoformDataset %>%
+  transmute(TIFseqData = map(data,UTRSequencesConversion,mainChrom,compChrom))
+
+# Check output by compring to 3UTR of known sequence
+
+# on the negative strand
+allMajor3UTR5UTRIsoformSequences %>%
+  unnest(TIFseqData) %>%
+  filter(gene == "YAL049C") %>%
+  pull(threePrimeUTR)
+
+# on the positive strand
+allMajor3UTR5UTRIsoformSequences %>%
+  unnest(TIFseqData) %>%
+  filter(gene == "YNL178W") %>%
+  pull(fivePrimeUTR)
+
+```
